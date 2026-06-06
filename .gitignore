@@ -1,0 +1,46 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Variables and secrets
+terraform.tfvars
+terraform.tfvars.json
+*.tfvars
+*.tfvars.json
+
+# SSH keys
+.ssh/
+*.pem
+id_ed25519*
+!.ssh/.gitkeep
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+*.tfstate.backup
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+terraform.log
+
+# Crash dumps
+crash.*.log
+
+# Backup files
+*.backup
+*.bak
+*.tmp
