@@ -1,10 +1,8 @@
-# stega-tracker sandbox
-
 One isolated Ubuntu 24.04 VM on local KVM/libvirt. Sandbox for running AI agents safely. Configured on first boot via cloud-init.
 
 # Specs
 
-- `dev-sandbox-1` — 8 vCPU, 18 GB RAM, 100 GB disk
+- `dev-sandbox-1` - 8 vCPU, 18 GB RAM, 100 GB disk
 - NAT network `10.10.10.0/24`, own DHCP + DNS
 - Ubuntu 24.04 cloud image (auto-downloaded)
 - XFCE desktop, autologin, over SPICE
