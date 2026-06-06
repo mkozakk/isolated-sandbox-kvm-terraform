@@ -1,0 +1,262 @@
+#cloud-config
+###############################################################################
+# stega-tracker sandbox VM — first-boot configuration.
+#
+# Two trust levels:
+#   ${normal_user}  -> human developer: full sudo, docker group, SSH.
+#   ${agents_user}  -> AI agents: no sudo (docker only via sudoers),
+#                      egress-firewalled, AppArmor-confined, audited.
+###############################################################################
+
+hostname: ${hostname}
+fqdn: ${fqdn}
+prefer_fqdn_over_hostname: true
+timezone: ${timezone}
+
+# Never set/expose a usable password; key-only login.
+ssh_pwauth: false
+disable_root: true
+
+users:
+  - name: ${normal_user}
+    gecos: "Human developer"
+    shell: /bin/bash
+    groups: [sudo, docker]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_authorized_key}
+
+  - name: ${agents_user}
+    gecos: "AI agent sandbox"
+    shell: /bin/bash
+    # Deliberately NOT in the docker or sudo group. Docker is granted narrowly
+    # through sudoers below; being in the docker group is root-equivalent.
+    groups: []
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_authorized_key}
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - git
+  - tmux
+  - neovim
+  - curl
+  - ca-certificates
+  - gnupg
+  - build-essential
+  - docker.io
+  - nftables
+  - auditd
+  - audispd-plugins
+  - apparmor
+  - apparmor-utils
+  - apparmor-profiles
+  - nodejs
+  - npm
+  # Graphical session (SPICE console via virt-manager / virt-viewer).
+  - xfce4
+  - xfce4-goodies
+  - lightdm
+  - spice-vdagent
+  - dbus-x11
+
+write_files:
+  ###########################################################################
+  # SSH hardening.
+  ###########################################################################
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      # Managed by cloud-init (stega-tracker).
+      PasswordAuthentication no
+      PermitRootLogin no
+      PubkeyAuthentication yes
+      ChallengeResponseAuthentication no
+      KbdInteractiveAuthentication no
+      UsePAM yes
+      X11Forwarding no
+      AllowAgentForwarding no
+      KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512
+      Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+      MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+      HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+      PubkeyAcceptedAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+
+  ###########################################################################
+  # Narrow docker access for the agents user (no docker group, no full sudo).
+  ###########################################################################
+  - path: /etc/sudoers.d/90-${agents_user}-docker
+    permissions: "0440"
+    owner: root:root
+    content: |
+      # The agents user may invoke docker, and only docker, as root.
+      ${agents_user} ALL=(root) NOPASSWD: /usr/bin/docker
+
+  ###########################################################################
+  # nftables egress firewall: restrict the agents user's outbound traffic.
+  # Everything from other users is left untouched.
+  ###########################################################################
+  - path: /etc/nftables.conf
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/sbin/nft -f
+      flush ruleset
+
+      table inet sandbox {
+        chain output {
+          type filter hook output priority filter; policy accept;
+
+          # Loopback is always fine.
+          oifname "lo" accept
+
+          # Only the agents user is restricted; everyone else is unaffected.
+          meta skuid != "${agents_user}" accept
+
+          # Allow replies to already-established connections.
+          ct state established,related accept
+
+          # DNS resolution.
+          udp dport 53 accept
+          tcp dport 53 accept
+
+          # Explicitly permitted outbound destination ports.
+          tcp dport { ${agents_allowed_ports} } accept
+
+          # Anything else originating from the agents user is dropped.
+          meta skuid "${agents_user}" log prefix "sandbox-agents-drop: " drop
+        }
+      }
+
+  ###########################################################################
+  # Resource limits for the agents user.
+  ###########################################################################
+  - path: /etc/security/limits.d/90-${agents_user}.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      # Cap file descriptors and processes for the agents sandbox account.
+      ${agents_user}  soft  nofile  4096
+      ${agents_user}  hard  nofile  8192
+      ${agents_user}  soft  nproc   512
+      ${agents_user}  hard  nproc   1024
+
+  ###########################################################################
+  # auditd: log all writes/attribute changes under the agents home dir.
+  ###########################################################################
+  - path: /etc/audit/rules.d/90-${agents_user}.rules
+    permissions: "0640"
+    owner: root:root
+    content: |
+      # Watch the agents user's home directory for writes and attr changes.
+      -w /home/${agents_user} -p wa -k ${agents_user}_home
+
+  ###########################################################################
+  # AppArmor profile constraining the agents user's interactive shell.
+  # Loaded in complain mode first (logs, does not block) so a bad rule can't
+  # lock the sandbox out; switch to enforce with `aa-enforce` once tuned.
+  ###########################################################################
+  - path: /etc/apparmor.d/sandbox.${agents_user}-shell
+    permissions: "0644"
+    owner: root:root
+    content: |
+      #include <tunables/global>
+
+      profile sandbox-${agents_user}-shell /bin/bash flags=(complain) {
+        #include <abstractions/base>
+        #include <abstractions/bash>
+        #include <abstractions/consoles>
+        #include <abstractions/nameservice>
+
+        # Read access to the system.
+        /usr/** rix,
+        /bin/** rix,
+        /sbin/** rix,
+        /lib/** rm,
+        /etc/** r,
+
+        # Full access only within the agents home and shared work areas.
+        owner /home/${agents_user}/ rw,
+        owner /home/${agents_user}/** rwkl,
+        /tmp/ rw,
+        /tmp/** rwkl,
+
+        # Deny peeking at the other user's home.
+        deny /home/${normal_user}/** rwklx,
+        deny /root/** rwklx,
+      }
+
+  ###########################################################################
+  # Graphical session: auto-login the human-developer user into XFCE on the
+  # SPICE console. Accounts have locked passwords (key-only over SSH), so the
+  # greeter can't be used interactively; autologin drops straight to a desktop.
+  ###########################################################################
+  - path: /etc/lightdm/lightdm.conf.d/50-autologin.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Seat:*]
+      autologin-user=${normal_user}
+      autologin-user-timeout=0
+      autologin-session=xfce
+
+runcmd:
+  ###########################################################################
+  # SSH hardening.
+  ###########################################################################
+  - [ systemctl, restart, ssh ]
+
+  ###########################################################################
+  # Firewall.
+  ###########################################################################
+  - [ systemctl, enable, --now, nftables ]
+  - [ nft, -f, /etc/nftables.conf ]
+
+  ###########################################################################
+  # Docker.
+  ###########################################################################
+  - [ systemctl, enable, --now, docker ]
+
+  ###########################################################################
+  # auditd.
+  ###########################################################################
+  - [ systemctl, enable, --now, auditd ]
+  - [ augenrules, --load ]
+
+  ###########################################################################
+  # AppArmor (load in complain mode).
+  ###########################################################################
+  - [ systemctl, enable, --now, apparmor ]
+  - "apparmor_parser -r -W /etc/apparmor.d/sandbox.${agents_user}-shell || true"
+  - "aa-complain /etc/apparmor.d/sandbox.${agents_user}-shell || true"
+
+  ###########################################################################
+  # Developer tooling: Claude Code CLI + Opencode.
+  ###########################################################################
+  - "npm install -g @anthropic-ai/claude-code || true"
+  - "npm install -g opencode-ai || true"
+
+  ###########################################################################
+  # Graphical session: boot into the desktop, enable autologin + clipboard.
+  ###########################################################################
+  - [ groupadd, -f, autologin ]
+  - [ groupadd, -f, nopasswdlogin ]
+  - "usermod -aG autologin,nopasswdlogin ${normal_user}"
+  - [ systemctl, set-default, graphical.target ]
+  - [ systemctl, enable, lightdm ]
+  - [ systemctl, enable, spice-vdagentd ]
+
+final_message: "stega-tracker sandbox '${hostname}' is up after $UPTIME seconds."
+
+# Reboot once after first-boot setup so the VM comes up in graphical.target
+# with lightdm autologin active on the SPICE console.
+power_state:
+  mode: reboot
+  message: "Rebooting into graphical session"
+  timeout: 30
+  condition: true
